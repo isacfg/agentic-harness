@@ -1,7 +1,7 @@
 ---
 name: harness
 
-description: "Run a large task through an agentic harness: a Planner breaks the goal into a DAG, Workers execute independent nodes in parallel (opening sub-nodes or declaring MISSING_INFO when the plan was wrong), deterministic checks gate an LLM Critic. MANDATORY TRIGGERS: 'use the harness', 'run the harness', 'harness this', 'plan and execute this'. STRONG TRIGGERS (use when the task is genuinely large): a migration across many files, an audit or sweep of a whole codebase, a feature that decomposes into several independent pieces, 'break this down and do it', 'do all of this in parallel'. Do NOT trigger on single-file edits, quick fixes, questions, or anything one agent finishes in one pass. Running the harness spawns many agents and costs real tokens, so the user must have asked for it or for multi-agent execution in their own words."
+description: "Use only when explicitly invoked."
 
 ---
 
