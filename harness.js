@@ -1,54 +1,31 @@
 export const meta = {
   name: "harness",
   description:
-    "Planner emits a DAG, Workers execute nodes in parallel with sub-nodes and MISSING_INFO replans, deterministic checks gate an LLM Critic",
+    "Explorer establishes facts, Planner emits a DAG, Workers execute ready nodes, checks gate a Critic, and an accepted run is packaged by a Promoter",
   phases: [
-    { title: "Plan", detail: "Planner emits a validated task DAG" },
-    { title: "Work", detail: "Workers execute ready nodes in parallel" },
-    { title: "Check", detail: "Tier 1 deterministic checks" },
+    { title: "Explore", detail: "Explorer establishes repository facts and a persistent run artifact directory" },
+    { title: "Plan", detail: "Planner emits a validated task DAG from exploration facts" },
+    { title: "Work", detail: "Workers execute ready nodes in parallel; failed dependencies block descendants" },
+    { title: "Check", detail: "Tier 1 declared checks" },
     { title: "Critique", detail: "Tier 2 Critic, only for check survivors" },
+    { title: "Promote", detail: "Accepted work is packaged into a durable handoff artifact" },
   ],
 };
 
-// ---------------------------------------------------------------------------
-// Input
-//
-// args = {
-//   goal:        string   (required) what to accomplish
-//   context?:    string   background handed to every role
-//   checks?:     string[] shell commands that must pass, e.g. ["npm test"]
-//   maxNodes?:   number   default 40
-//   maxDepth?:   number   default 2   sub-node nesting depth
-//   maxReplans?: number   default 2
-//   contextChars?: number default 6000  upstream-result budget per worker prompt
-//   tiered?:     boolean  default true. false = every role runs on the origin
-//                thread's own provider/model/reasoning. Tiering itself is
-//                configured in roleAgent() below; the runtime requires literals.
-// }
-// ---------------------------------------------------------------------------
-
-// Depending on the caller, args can arrive as a real object or as a JSON string.
-// Accept both rather than failing on a serialization detail.
 let input = args || {};
 if (typeof input === "string") {
   try {
     input = JSON.parse(input);
   } catch (error) {
-    throw new Error(
-      `harness: args arrived as a string that is not valid JSON. Pass args as a JSON object. Parse error: ${error.message}`,
-    );
+    throw new Error(`harness: args must be valid JSON: ${error.message}`);
   }
 }
 if (typeof input !== "object" || Array.isArray(input)) {
-  throw new Error("harness: args must be a JSON object, e.g. { \"goal\": \"...\" }");
+  throw new Error("harness: args must be a JSON object");
 }
 
 const GOAL = input.goal;
-if (!GOAL || typeof GOAL !== "string") {
-  throw new Error(
-    `harness: args.goal is required and must be a string. Received keys: [${Object.keys(input).join(", ")}]`,
-  );
-}
+if (!GOAL || typeof GOAL !== "string") throw new Error("harness: args.goal is required and must be a string");
 
 const BACKGROUND = input.context || "";
 const CHECKS = Array.isArray(input.checks) ? input.checks : [];
@@ -56,71 +33,36 @@ const MAX_NODES = input.maxNodes || 40;
 const MAX_DEPTH = input.maxDepth === undefined ? 2 : input.maxDepth;
 const MAX_REPLANS = input.maxReplans === undefined ? 2 : input.maxReplans;
 const CONTEXT_CHARS = input.contextChars || 6000;
-
-const limits = budget();
-log(
-  `harness: goal set. limits: ${limits.maxAgentCalls} agent calls, ${limits.maxConcurrentAgents} concurrent. maxNodes=${MAX_NODES} maxDepth=${MAX_DEPTH} maxReplans=${MAX_REPLANS}`,
-);
-
-// ---------------------------------------------------------------------------
-// Role dispatch
-//
-// Agent options must be plain properties, so the tiered and inherited calls are
-// written out separately rather than spread. Omitting the selection fields
-// inherits the origin thread's provider, model, and reasoning level; a partial
-// override is rejected by the runtime, so a tier must supply all three.
-// ---------------------------------------------------------------------------
-
-// EDIT THE TUPLES BELOW TO RETUNE THE HARNESS. The runtime requires literal
-// provider/model/reasoning strings, so tiering cannot come from args. Pass
-// `tiered: false` to ignore these entirely and run every role on the origin
-// thread's own selection.
-//
-// The economics from the source article: the Planner and Critic think, the
-// Workers grind. Reasoning level is the lever here rather than model choice,
-// because the same model at a lower level is the cheaper worker without
-// guessing at a strength ordering between sibling models. If you learn one of
-// the sibling models is genuinely cheaper, put it on the worker line.
-
 const TIERED = input.tiered !== false;
 
+const limits = budget();
+log(`harness: limits ${limits.maxAgentCalls} calls / ${limits.maxConcurrentAgents} concurrent; maxNodes=${MAX_NODES} maxDepth=${MAX_DEPTH} maxReplans=${MAX_REPLANS}`);
+
 function roleAgent(prompt, label, phaseName, schema, role) {
-  if (!TIERED) {
-    return agent(prompt, { label: label, phase: phaseName, schema: schema });
-  }
-  if (role === "planner") {
-    return agent(prompt, {
-      label: label,
-      phase: phaseName,
-      schema: schema,
-      provider: "codex",
-      model: "gpt-5.6-luna",
-      reasoningLevel: "high",
-    });
-  }
-  if (role === "critic") {
-    return agent(prompt, {
-      label: label,
-      phase: phaseName,
-      schema: schema,
-      provider: "codex",
-      model: "gpt-5.6-luna",
-      reasoningLevel: "high",
-    });
-  }
+  if (!TIERED) return agent(prompt, { label, phase: phaseName, schema });
+  const high = role === "planner" || role === "critic";
   return agent(prompt, {
-    label: label,
+    label,
     phase: phaseName,
-    schema: schema,
+    schema,
     provider: "codex",
     model: "gpt-5.6-luna",
-    reasoningLevel: "medium",
+    reasoningLevel: high ? "high" : "medium",
   });
 }
 
-// ---------------------------------------------------------------------------
-// Schemas
-// ---------------------------------------------------------------------------
+const EXPLORER_SCHEMA = {
+  type: "object",
+  required: ["artifactDir", "summary", "facts", "relevantFiles", "constraints", "unknowns"],
+  properties: {
+    artifactDir: { type: "string" },
+    summary: { type: "string" },
+    facts: { type: "array", items: { type: "string" } },
+    relevantFiles: { type: "array", items: { type: "string" } },
+    constraints: { type: "array", items: { type: "string" } },
+    unknowns: { type: "array", items: { type: "string" } },
+  },
+};
 
 const DAG_SCHEMA = {
   type: "object",
@@ -198,40 +140,40 @@ const CRITIC_SCHEMA = {
   },
 };
 
-// ---------------------------------------------------------------------------
-// DAG validation. The planner is a model; treat its output as untrusted.
-// ---------------------------------------------------------------------------
+const PROMOTER_SCHEMA = {
+  type: "object",
+  required: ["summary", "releaseNotes", "followUps", "artifact"],
+  properties: {
+    summary: { type: "string" },
+    releaseNotes: { type: "array", items: { type: "string" } },
+    followUps: { type: "array", items: { type: "string" } },
+    artifact: { type: "string" },
+  },
+};
 
 function validateDag(nodes) {
   const problems = [];
   const seen = {};
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
+  for (const node of nodes) {
     if (seen[node.id]) problems.push(`duplicate node id "${node.id}"`);
     seen[node.id] = true;
   }
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-    const deps = node.deps || [];
-    for (let j = 0; j < deps.length; j++) {
-      if (deps[j] === node.id) problems.push(`node "${node.id}" depends on itself`);
-      else if (!seen[deps[j]]) problems.push(`node "${node.id}" depends on unknown node "${deps[j]}"`);
+  for (const node of nodes) {
+    for (const dep of node.deps || []) {
+      if (dep === node.id) problems.push(`node "${node.id}" depends on itself`);
+      else if (!seen[dep]) problems.push(`node "${node.id}" depends on unknown node "${dep}"`);
     }
   }
-  if (nodes.length > MAX_NODES) {
-    problems.push(`plan has ${nodes.length} nodes, over the maxNodes ceiling of ${MAX_NODES}`);
-  }
-  // Kahn's algorithm: whatever cannot be peeled off is in a cycle.
+  if (nodes.length > MAX_NODES) problems.push(`plan has ${nodes.length} nodes, over maxNodes=${MAX_NODES}`);
   const remaining = {};
-  for (let i = 0; i < nodes.length; i++) remaining[nodes[i].id] = (nodes[i].deps || []).slice();
+  for (const node of nodes) remaining[node.id] = (node.deps || []).slice();
   let peeled = true;
   while (peeled) {
     peeled = false;
-    const ids = Object.keys(remaining);
-    for (let i = 0; i < ids.length; i++) {
-      const pending = remaining[ids[i]].filter((dep) => remaining[dep] !== undefined);
-      if (pending.length === 0) {
-        delete remaining[ids[i]];
+    for (const id of Object.keys(remaining)) {
+      const pending = remaining[id].filter((dep) => remaining[dep] !== undefined);
+      if (!pending.length) {
+        delete remaining[id];
         peeled = true;
       }
     }
@@ -241,80 +183,22 @@ function validateDag(nodes) {
   return problems;
 }
 
-// ---------------------------------------------------------------------------
-// Prompts
-// ---------------------------------------------------------------------------
+const BASE_PREAMBLE = `You are one role inside an agentic harness. Keep your role isolated.\n\nGOAL\n${GOAL}${BACKGROUND ? `\n\nBACKGROUND\n${BACKGROUND}` : ""}`;
 
-const ROLE_PREAMBLE = `You are one role inside an agentic harness. A Planner breaks a
-goal into a DAG of tasks, Workers execute one node each in parallel, and a Critic
-verifies the finished work. Do the job of your role and nothing else.
-
-GOAL
-${GOAL}
-${BACKGROUND ? `\nBACKGROUND\n${BACKGROUND}\n` : ""}`;
-
-function plannerPrompt(previousAttempt) {
-  return `${ROLE_PREAMBLE}
-YOUR ROLE: PLANNER
-
-Break the goal into a DAG of tasks and return it. Each node is one unit of work a
-single agent can finish on its own.
-
-Sizing is the thing you most often get wrong. A node that takes one edit is too
-small: spawning an agent for it costs more than doing it. A node that touches six
-files across three concerns is too large: it cannot be verified and it cannot run
-beside anything else. Aim for a node a competent engineer would finish in one
-sitting and could describe in one sentence.
-
-Dependencies are what force order. Two nodes with no dependency between them run
-at the same time, so declare a dependency only when the second genuinely cannot
-start until the first is done. Over-declaring dependencies serializes the run and
-wastes most of the benefit of this harness.
-
-For each node give:
-  id     short, stable, kebab-case
-  task   what to do, concrete enough that a worker needs no clarification
-  deps   ids this node truly must wait for, [] when it can start immediately
-  checks optional shell commands that would prove this node is done
-
-Ceiling: ${MAX_NODES} nodes. Explore the codebase before planning; do not plan
-against assumptions you have not checked.
-${
-  previousAttempt
-    ? `\nTHIS IS A REPLAN. The previous plan stalled. Do not re-emit it.\n\nWhat was already completed and must NOT be redone:\n${previousAttempt.completed}\n\nWhy the run stalled:\n${previousAttempt.reason}\n\nPlan from the current state of the work, not from scratch. Include only what remains.`
-    : ""
-}`;
+function rolePreamble(artifactDir) {
+  return `${BASE_PREAMBLE}${artifactDir ? `\n\nRUN ARTIFACT DIRECTORY\n${artifactDir}\nKeep role audit artifacts inside this directory.` : ""}`;
 }
 
-function workerPrompt(node, upstream, depth) {
-  return `${ROLE_PREAMBLE}
-YOUR ROLE: WORKER
+function explorerPrompt() {
+  return `${BASE_PREAMBLE}\n\nYOUR ROLE: EXPLORER\n\nEstablish facts before anyone plans or implements. Read the repository, relevant docs, tests, configuration, and existing patterns. Do not implement the goal and do not modify source, tests, configuration, or product documentation.\n\nCreate one unique directory under artifacts/runs/ for this execution. Use a readable unique id such as UTC timestamp + short goal slug; if that exact path exists, add a short suffix instead of overwriting another run. The only files you may write are inside that run directory. Write exploration.md there with verified facts, relevant files, constraints, unknowns, and important disproved assumptions.\n\nReturn artifactDir as the exact relative directory you created. Keep facts concrete. A design document describing something is not proof that implementation exists.`;
+}
 
-YOUR NODE: ${node.id}
-${node.task}
+function plannerPrompt(previousAttempt, exploration, artifactDir, replanNumber) {
+  return `${rolePreamble(artifactDir)}\n\nYOUR ROLE: PLANNER\n\nThe Explorer already performed broad discovery. Use this as your primary factual input; do not repeat broad repository exploration. You may inspect a specific file only to resolve a narrow ambiguity.\n\nEXPLORATION\n${JSON.stringify(exploration, null, 2)}\n\nBreak the remaining goal into a DAG. Each node should be one coherent unit a competent engineer can finish in one sitting. Dependencies are only for genuine execution order. For each node return id, task, deps, and optional checks. Ceiling: ${MAX_NODES} nodes.\n${previousAttempt ? `\nTHIS IS A REPLAN. Do not redo completed work.\nCompleted:\n${previousAttempt.completed}\n\nWhy the run stalled:\n${previousAttempt.reason}\nPlan from the current workspace state.` : ""}\n\nWrite the accepted proposal to ${artifactDir}/${replanNumber ? `replan-${replanNumber}.md` : "plan.md"}.`;
+}
 
-${upstream}
-
-Do the work. Then report with one of three statuses:
-
-  done         you finished the node. Put what you did in "summary" and list the
-               files you touched.
-
-  subnodes     the node turned out to contain distinct pieces of work that should
-               run separately. Return them in "subnodes". Use this when you
-               genuinely discovered structure, not to avoid doing the work. You
-               are at depth ${depth} of a maximum of ${MAX_DEPTH}; at the maximum
-               this option is unavailable and you must finish or report
-               missing_info.
-
-  missing_info something the plan assumed is not true, and no amount of work on
-               this node will fix it. Put the specific fact you needed and could
-               not get in "missingInfo". This triggers a replan, which is
-               expensive, so do not use it for something you could resolve by
-               reading the code.
-
-Report honestly. A node reported "done" that is half-finished corrupts everything
-downstream, because later nodes are told it succeeded.`;
+function workerPrompt(node, upstream, depth, artifactDir) {
+  return `${rolePreamble(artifactDir)}\n\nYOUR ROLE: WORKER\n\nYOUR NODE: ${node.id}\n${node.task}\n\n${upstream}\n\nDo only this node. Return status done when finished; subnodes only when genuinely distinct discovered work should run separately; missing_info only when a plan assumption is false and cannot be resolved by reading the workspace. You are at depth ${depth}/${MAX_DEPTH}. Report files touched honestly.`;
 }
 
 function buildUpstreamContext(node, results) {
@@ -323,10 +207,10 @@ function buildUpstreamContext(node, results) {
   const parts = [];
   let used = 0;
   let dropped = 0;
-  for (let i = 0; i < deps.length; i++) {
-    const result = results[deps[i]];
+  for (const dep of deps) {
+    const result = results[dep];
     if (!result) continue;
-    const block = `--- result of "${deps[i]}" ---\n${result.summary}`;
+    const block = `--- usable result of "${dep}" ---\n${result.summary}`;
     if (used + block.length > CONTEXT_CHARS) {
       dropped++;
       continue;
@@ -334,18 +218,33 @@ function buildUpstreamContext(node, results) {
     parts.push(block);
     used += block.length;
   }
-  let text = `RESULTS OF THE NODES YOU DEPEND ON:\n\n${parts.join("\n\n")}`;
-  if (dropped > 0) {
-    // Explicit truncation. The worker is told what it is missing rather than
-    // being handed a silently shortened context.
-    text += `\n\n[TRUNCATED: ${dropped} upstream result(s) did not fit the ${CONTEXT_CHARS} character budget and were dropped. If you need them, read the work on disk rather than assuming.]`;
-  }
+  let text = `RESULTS OF USABLE UPSTREAM NODES:\n\n${parts.join("\n\n")}`;
+  if (dropped) text += `\n\n[TRUNCATED: ${dropped} upstream result(s) did not fit the ${CONTEXT_CHARS} character budget. Read the workspace if needed.]`;
   return text;
 }
 
-// ---------------------------------------------------------------------------
-// Execution
-// ---------------------------------------------------------------------------
+function blockFailedDescendants(nodes, results, trace) {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const node of nodes) {
+      if (results[node.id]) continue;
+      const blockedBy = (node.deps || []).filter((dep) => {
+        const result = results[dep];
+        return result && (result.failed || result.blocked);
+      });
+      if (!blockedBy.length) continue;
+      results[node.id] = {
+        summary: `BLOCKED: dependency failure prevents execution (${blockedBy.join(", ")})`,
+        blocked: true,
+        blockedBy,
+      };
+      trace.push({ node: node.id, status: "blocked", blockedBy });
+      log(`node ${node.id} BLOCKED by ${blockedBy.join(", ")}`);
+      changed = true;
+    }
+  }
+}
 
 const results = {};
 const nodeDepth = {};
@@ -354,43 +253,37 @@ let nodes = [];
 let replans = 0;
 let stalled = null;
 
-phase("Plan");
+phase("Explore");
+const exploration = await roleAgent(explorerPrompt(), "explorer", "Explore", EXPLORER_SCHEMA, "explorer");
+const ARTIFACT_DIR = exploration.artifactDir;
+log(`exploration complete; artifacts: ${ARTIFACT_DIR}`);
 
-let plan = await roleAgent(plannerPrompt(null), "planner", "Plan", DAG_SCHEMA, "planner");
+phase("Plan");
+let plan = await roleAgent(plannerPrompt(null, exploration, ARTIFACT_DIR, 0), "planner", "Plan", DAG_SCHEMA, "planner");
 let problems = validateDag(plan.nodes);
 if (problems.length) {
-  // One corrective pass. The planner is shown its own invalid graph.
-  log(`planner produced an invalid DAG: ${problems.join("; ")}. Asking once for a fix.`);
-  plan = await roleAgent(
-    `${plannerPrompt(null)}\n\nYour previous plan was REJECTED by graph validation:\n${problems.map((p) => `- ${p}`).join("\n")}\n\nReturn a corrected plan.`,
-    "planner:retry",
-    "Plan",
-    DAG_SCHEMA,
-    "planner",
-  );
+  log(`planner produced invalid DAG: ${problems.join("; ")}; asking once for correction`);
+  plan = await roleAgent(`${plannerPrompt(null, exploration, ARTIFACT_DIR, 0)}\n\nGRAPH VALIDATION REJECTED THE PREVIOUS PLAN:\n${problems.map((p) => `- ${p}`).join("\n")}\nReturn a corrected plan and replace plan.md.`, "planner:retry", "Plan", DAG_SCHEMA, "planner");
   problems = validateDag(plan.nodes);
-  if (problems.length) {
-    throw new Error(`harness: planner could not produce a valid DAG: ${problems.join("; ")}`);
-  }
+  if (problems.length) throw new Error(`harness: planner could not produce a valid DAG: ${problems.join("; ")}`);
 }
 
 nodes = plan.nodes;
-for (let i = 0; i < nodes.length; i++) nodeDepth[nodes[i].id] = 0;
+for (const node of nodes) nodeDepth[node.id] = 0;
 log(`plan accepted: ${nodes.length} nodes`);
 
 phase("Work");
-
 let working = true;
 while (working) {
   working = false;
+  blockFailedDescendants(nodes, results, trace);
 
-  // Level-synchronous execution: every node whose dependencies are satisfied
-  // runs at once. parallel() is a barrier, so the loop advances one level per
-  // pass. The runtime caps actual concurrency at maxConcurrentAgents.
   const ready = nodes.filter((node) => {
     if (results[node.id]) return false;
-    const deps = node.deps || [];
-    for (let i = 0; i < deps.length; i++) if (!results[deps[i]]) return false;
+    for (const dep of node.deps || []) {
+      const result = results[dep];
+      if (!result || result.failed || result.blocked) return false;
+    }
     return true;
   });
 
@@ -398,42 +291,26 @@ while (working) {
     const unfinished = nodes.filter((node) => !results[node.id]);
     if (!unfinished.length) break;
     stalled = {
-      reason: `No node is runnable but ${unfinished.length} remain: ${unfinished.map((n) => n.id).join(", ")}. Their dependencies never completed.`,
-      completed: Object.keys(results)
-        .map((id) => `- ${id}: ${results[id].summary}`)
-        .join("\n"),
+      reason: `No node is runnable but ${unfinished.length} remain: ${unfinished.map((n) => n.id).join(", ")}`,
+      completed: Object.keys(results).map((id) => `- ${id}: ${results[id].summary}`).join("\n"),
     };
     break;
   }
 
-  log(`level: running ${ready.length} node(s) in parallel: ${ready.map((n) => n.id).join(", ")}`);
-
-  const batch = await parallel(
-    ready.map((node) => () => {
-      const depth = nodeDepth[node.id] || 0;
-      return roleAgent(
-        workerPrompt(node, buildUpstreamContext(node, results), depth),
-        `work:${node.id}`,
-        "Work",
-        WORKER_SCHEMA,
-        "worker",
-      ).then((result) => ({ node: node, result: result }));
-    }),
-  );
+  log(`running ${ready.length} node(s): ${ready.map((n) => n.id).join(", ")}`);
+  const batch = await parallel(ready.map((node) => () => {
+    const depth = nodeDepth[node.id] || 0;
+    return roleAgent(workerPrompt(node, buildUpstreamContext(node, results), depth, ARTIFACT_DIR), `work:${node.id}`, "Work", WORKER_SCHEMA, "worker").then((result) => ({ node, result }));
+  }));
 
   let missingInfo = null;
-
   for (let i = 0; i < batch.length; i++) {
     const entry = batch[i];
     if (!entry) {
-      // The agent failed after the runtime exhausted its retries.
       const failedNode = ready[i];
-      results[failedNode.id] = {
-        summary: `WORKER FAILED: this node's agent errored and produced no result.`,
-        failed: true,
-      };
+      results[failedNode.id] = { summary: "WORKER FAILED: agent errored and produced no result.", failed: true };
       trace.push({ node: failedNode.id, status: "failed" });
-      log(`node ${failedNode.id} FAILED (agent error)`);
+      log(`node ${failedNode.id} FAILED`);
       continue;
     }
 
@@ -451,28 +328,20 @@ while (working) {
       const children = (result.subnodes || []).filter((child) => child && child.id && child.task);
       if (children.length) {
         const known = {};
-        for (let k = 0; k < nodes.length; k++) known[nodes[k].id] = true;
+        for (const existing of nodes) known[existing.id] = true;
         const added = [];
-        for (let c = 0; c < children.length; c++) {
-          // Namespace the child id so two parents cannot collide, and so a child
-          // can never accidentally name an existing node.
-          const childId = `${node.id}/${children[c].id}`;
+        for (const child of children) {
+          const childId = `${node.id}/${child.id}`;
           if (known[childId]) continue;
-          if (nodes.length + added.length + 1 > MAX_NODES) {
-            log(`maxNodes (${MAX_NODES}) reached: dropping remaining sub-nodes of ${node.id}`);
-            break;
-          }
-          added.push({ id: childId, task: children[c].task, deps: [] });
+          if (nodes.length + added.length + 1 > MAX_NODES) break;
+          added.push({ id: childId, task: child.task, deps: [] });
         }
         if (added.length) {
-          for (let a = 0; a < added.length; a++) {
-            nodes.push(added[a]);
-            nodeDepth[added[a].id] = depth + 1;
+          for (const child of added) {
+            nodes.push(child);
+            nodeDepth[child.id] = depth + 1;
           }
-          // The parent is rewritten to depend on its children and re-run after
-          // them, so its result is the one downstream nodes actually consume.
           node.deps = (node.deps || []).concat(added.map((child) => child.id));
-          nodeDepth[node.id] = depth;
           trace.push({ node: node.id, status: "expanded", children: added.length });
           log(`node ${node.id} opened ${added.length} sub-node(s)`);
           working = true;
@@ -481,43 +350,27 @@ while (working) {
       }
     }
 
-    // done, or a status whose escape hatch is exhausted at this depth
     results[node.id] = {
       summary: result.summary,
       filesTouched: result.filesTouched || [],
       degraded: result.status !== "done",
     };
     trace.push({ node: node.id, status: result.status });
-    if (result.status !== "done") {
-      log(`node ${node.id} returned "${result.status}" but its escape hatch is exhausted; accepting as-is`);
-    }
   }
+
+  blockFailedDescendants(nodes, results, trace);
 
   if (missingInfo) {
     replans++;
-    log(`MISSING_INFO from ${missingInfo.node}. Replan ${replans}/${MAX_REPLANS}.`);
     phase("Plan");
-    const completed = Object.keys(results)
-      .map((id) => `- ${id}: ${results[id].summary}`)
-      .join("\n");
-    const replan = await roleAgent(
-      plannerPrompt({
-        completed: completed || "Nothing completed yet.",
-        reason: `Worker on node "${missingInfo.node}" reported MISSING_INFO: ${missingInfo.detail}`,
-      }),
-      `planner:replan-${replans}`,
-      "Plan",
-      DAG_SCHEMA,
-      "planner",
-    );
+    const completed = Object.keys(results).filter((id) => !results[id].failed && !results[id].blocked).map((id) => `- ${id}: ${results[id].summary}`).join("\n");
+    const replan = await roleAgent(plannerPrompt({ completed: completed || "Nothing completed yet.", reason: `Worker "${missingInfo.node}" reported MISSING_INFO: ${missingInfo.detail}` }, exploration, ARTIFACT_DIR, replans), `planner:replan-${replans}`, "Plan", DAG_SCHEMA, "planner");
     const replanProblems = validateDag(replan.nodes);
     if (replanProblems.length) {
-      log(`replan ${replans} produced an invalid DAG (${replanProblems.join("; ")}); continuing with the existing plan`);
+      log(`replan ${replans} invalid (${replanProblems.join("; ")}); keeping existing plan`);
     } else {
       nodes = replan.nodes.filter((node) => !results[node.id]);
-      for (let i = 0; i < nodes.length; i++) {
-        if (nodeDepth[nodes[i].id] === undefined) nodeDepth[nodes[i].id] = 0;
-      }
+      for (const node of nodes) if (nodeDepth[node.id] === undefined) nodeDepth[node.id] = 0;
       log(`replan accepted: ${nodes.length} remaining node(s)`);
     }
     phase("Work");
@@ -525,110 +378,64 @@ while (working) {
     continue;
   }
 
-  const outstanding = nodes.filter((node) => !results[node.id]);
-  if (outstanding.length) working = true;
+  if (nodes.some((node) => !results[node.id])) working = true;
 }
 
 const failedNodes = Object.keys(results).filter((id) => results[id].failed);
+const blockedNodes = Object.keys(results).filter((id) => results[id].blocked);
 const degradedNodes = Object.keys(results).filter((id) => results[id].degraded);
-const workSummary = Object.keys(results)
-  .map((id) => `- ${id}${results[id].failed ? " [FAILED]" : results[id].degraded ? " [DEGRADED]" : ""}: ${results[id].summary}`)
-  .join("\n");
+const workSummary = Object.keys(results).map((id) => {
+  const label = results[id].failed ? " [FAILED]" : results[id].blocked ? " [BLOCKED]" : results[id].degraded ? " [DEGRADED]" : "";
+  return `- ${id}${label}: ${results[id].summary}`;
+}).join("\n");
 
-// ---------------------------------------------------------------------------
-// Tier 1: deterministic checks. Cheap, and it gates the expensive Critic.
-// The script has no shell access, so one agent runs the commands and reports.
-// ---------------------------------------------------------------------------
-
-const declaredChecks = CHECKS.concat(
-  nodes.reduce((all, node) => all.concat(node.checks || []), []),
-).filter((check, index, list) => list.indexOf(check) === index);
-
+const declaredChecks = CHECKS.concat(nodes.reduce((all, node) => all.concat(node.checks || []), [])).filter((check, index, list) => list.indexOf(check) === index);
 let checkResult = null;
-if (declaredChecks.length) {
+if (declaredChecks.length && !failedNodes.length && !blockedNodes.length) {
   phase("Check");
-  checkResult = await agent(
-    `${ROLE_PREAMBLE}
-YOUR ROLE: TIER 1 CHECKER
-
-Run each of these commands exactly as written, from the workspace root, and report
-what happened. Do not fix anything. Do not modify any file. You are a gate, not a
-worker.
-
-${declaredChecks.map((check, index) => `${index + 1}. ${check}`).join("\n")}
-
-"passed" is true only if every command exited successfully. For each failure put
-the command and the relevant output in "failures". Keep the report short; quote
-only the lines that show the failure.`,
-    { label: "tier1-checks", phase: "Check", schema: CHECK_SCHEMA },
-  );
-  log(`tier 1 checks: ${checkResult.passed ? "PASSED" : "FAILED"} (${declaredChecks.length} command(s))`);
+  checkResult = await agent(`${rolePreamble(ARTIFACT_DIR)}\n\nYOUR ROLE: TIER 1 CHECKER\n\nRun each command exactly as written from the workspace root. Do not fix or modify anything. passed=true only if every command exits successfully.\n\n${declaredChecks.map((check, index) => `${index + 1}. ${check}`).join("\n")}`, { label: "tier1-checks", phase: "Check", schema: CHECK_SCHEMA });
+  log(`tier 1 checks: ${checkResult.passed ? "PASSED" : "FAILED"}`);
+} else if (failedNodes.length || blockedNodes.length) {
+  log("tier 1 skipped because execution contains failed or blocked nodes");
 } else {
-  log("tier 1 skipped: no checks declared. The Critic is the only gate.");
+  log("tier 1 skipped: no checks declared");
 }
-
-// ---------------------------------------------------------------------------
-// Tier 2: the Critic, reached only by tier-1 survivors.
-// ---------------------------------------------------------------------------
 
 let critique = null;
 let criticSkipped = null;
-
 if (checkResult && !checkResult.passed) {
-  criticSkipped = "tier 1 checks failed, so the Critic was not run";
-  log(`Critic SKIPPED: ${criticSkipped}`);
-} else if (failedNodes.length) {
-  criticSkipped = `${failedNodes.length} node(s) failed outright, so the Critic was not run`;
-  log(`Critic SKIPPED: ${criticSkipped}`);
+  criticSkipped = "tier 1 checks failed";
+} else if (failedNodes.length || blockedNodes.length) {
+  criticSkipped = `${failedNodes.length} failed node(s), ${blockedNodes.length} blocked node(s)`;
 } else {
   phase("Critique");
-  critique = await roleAgent(
-    `${ROLE_PREAMBLE}
-YOUR ROLE: CRITIC
-
-The work is finished. Decide whether it actually meets the goal.
-
-WHAT THE WORKERS REPORTED
-${workSummary}
-${checkResult ? `\nTIER 1 CHECKS: passed\n${checkResult.report}` : "\nNo deterministic checks were declared, so you are the only gate. Weigh that."}
-
-Verify against the work on disk, not against the summaries. Workers overstate.
-Read what they claim to have written.
-
-Reject when the goal is not met, when a worker claimed something it did not do,
-when the pieces do not fit together, or when the work is correct but leaves the
-codebase worse. Accept when the goal is met, even if you would have done it
-differently. Taste is not a blocking issue.
-
-Be specific. "Could be cleaner" is not a finding. Name the file and what is wrong.`,
-    "critic",
-    "Critique",
-    CRITIC_SCHEMA,
-    "critic",
-  );
+  critique = await roleAgent(`${rolePreamble(ARTIFACT_DIR)}\n\nYOUR ROLE: CRITIC\n\nDecide whether the final workspace actually meets the goal. Verify on disk, not from worker summaries. Use Explorer constraints as factual context. Reject false claims, missing work, pieces that do not fit, or material regressions. Taste is not blocking.\n\nEXPLORATION\n${JSON.stringify(exploration, null, 2)}\n\nWORKERS\n${workSummary}\n${checkResult ? `\nCHECKS PASSED\n${checkResult.report}` : "\nNo declared checks ran; you are the only final gate."}\n\nWrite critique.md into ${ARTIFACT_DIR} with verdict and concrete issues.`, "critic", "Critique", CRITIC_SCHEMA, "critic");
   log(`critic verdict: ${critique.verdict}`);
+}
+
+let promotion = null;
+if (critique && critique.verdict === "accept") {
+  phase("Promote");
+  promotion = await roleAgent(`${rolePreamble(ARTIFACT_DIR)}\n\nYOUR ROLE: PROMOTER\n\nThe Critic accepted the implementation. Do not modify implementation files. Package the accepted run for handoff: concise summary, concrete release/PR notes, validation evidence that actually ran, and follow-up work. Do not invent checks. Write the durable handoff to ${ARTIFACT_DIR}/promotion.md and return that exact path in artifact.\n\nWORK\n${workSummary}\n\nCHECKS\n${checkResult ? checkResult.report : "No declared checks ran."}\n\nCRITIC\n${critique.summary}`, "promoter", "Promote", PROMOTER_SCHEMA, "promoter");
+  log("promotion artifact written");
 }
 
 const blocking = critique ? (critique.issues || []).filter((issue) => issue.severity === "blocking") : [];
 
 return {
   goal: GOAL,
-  outcome: critique
-    ? critique.verdict === "accept"
-      ? "accepted"
-      : "rejected"
-    : "unverified",
-  plan: { nodes: nodes.length, replans: replans, rationale: plan.rationale || null },
+  outcome: critique ? (critique.verdict === "accept" ? "accepted" : "rejected") : "unverified",
+  artifacts: { dir: ARTIFACT_DIR, exploration: `${ARTIFACT_DIR}/exploration.md`, plan: `${ARTIFACT_DIR}/plan.md`, critique: critique ? `${ARTIFACT_DIR}/critique.md` : null, promotion: promotion ? promotion.artifact : null },
+  exploration,
+  plan: { nodes: nodes.length, replans, rationale: plan.rationale || null },
   nodes: trace,
   failed: failedNodes,
+  blocked: blockedNodes,
   degraded: degradedNodes,
   stalled: stalled ? stalled.reason : null,
-  checks: checkResult
-    ? { ran: declaredChecks, passed: checkResult.passed, failures: checkResult.failures || [] }
-    : { ran: [], passed: null, failures: [] },
-  critic: critique
-    ? { verdict: critique.verdict, summary: critique.summary, blocking: blocking.length, issues: critique.issues || [] }
-    : null,
-  criticSkipped: criticSkipped,
+  checks: checkResult ? { ran: declaredChecks, passed: checkResult.passed, failures: checkResult.failures || [] } : { ran: [], passed: null, failures: [] },
+  critic: critique ? { verdict: critique.verdict, summary: critique.summary, blocking: blocking.length, issues: critique.issues || [] } : null,
+  criticSkipped,
+  promotion,
   work: workSummary,
 };
