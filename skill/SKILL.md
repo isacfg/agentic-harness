@@ -43,39 +43,44 @@ Present choices in this shape:
 
 ```text
 BB Workflows
-Reasoning tier: provider / model / reasoning level
-Execution tier: provider / model / reasoning level
+Reasoning tier: provider / model / reasoning level | inherit current
+Execution tier: provider / model / reasoning level | inherit current
 
 Available providers/models:
 - codex: ...
 - claude-code: ...
 ```
 
-BB requires all three override fields together: `provider`, `model`, and `reasoningLevel`. If a tier should inherit the originating BB thread, omit all three for that tier.
+BB requires all three override fields together: `provider`, `model`, and `reasoningLevel`. A tier that inherits must omit the entire tuple.
 
-The distributed `harness.js` contains literal BB tuples because BB requires literal selection values in agent calls. Before a tiered BB run, copy it into the target project and replace the two marked BB model profiles with the exact tuples selected from the live catalog. Do not mutate the source copy in this skill directory.
+The distributed `harness.js` contains two explicitly marked literal BB profile blocks because BB requires literal selection values in `agent()` calls. Before a tiered BB run:
 
-Install/refresh the project copy:
+1. copy `harness.js` into the target project's `.bb/workflows/`;
+2. rewrite `BB_REASONING_PROFILE_*` with the selected Reasoning tuple unless that tier inherits;
+3. rewrite `BB_EXECUTION_PROFILE_*` with the selected Execution tuple unless that tier inherits;
+4. validate the exact copied file before execution.
+
+Do not mutate the source copy in this skill directory.
 
 ```bash
 mkdir -p .bb/workflows
 cp ~/.claude/skills/harness/harness.js .bb/workflows/harness.js
+bb workflows validate --file .bb/workflows/harness.js
 ```
 
-Then patch the marked reasoning/execution tuples, validate the exact file, and run:
+Run with `tiered: true` after explicit model selection:
 
 ```bash
-bb workflows validate --file .bb/workflows/harness.js
 bb workflows run --file .bb/workflows/harness.js --args '{"runtime":"bb","goal":"...","context":"...","checks":[],"tiered":true}'
 ```
 
-If both tiers inherit the origin thread, use `"tiered": false` and do not patch model tuples.
+For a mixed profile, set `inheritReasoning: true` and/or `inheritExecution: true` for the tier that should inherit the originating BB thread. If both tiers inherit, use `tiered: false` and do not patch either tuple.
 
 After a BB workflow tool call returns, emit its `previewDirective` once on its own line.
 
 ## Claude Code Dynamic Workflows preflight
 
-Use Claude Code's live `/model` picker as the source of truth for models available to the current account/session. Ask the user to choose from what `/model` shows rather than assuming that every Claude alias is enabled by their organization.
+Use Claude Code's live `/model` picker as the source of truth for models available to the current account/session. Ask the user to choose from what `/model` shows rather than assuming that every Claude model or alias is enabled by their organization.
 
 Ask for:
 
@@ -85,16 +90,16 @@ Reasoning model: <model from /model> | inherit session
 Execution model: <model from /model> | inherit session
 ```
 
-Claude workflow agents inherit the session model when no model is supplied. The workflow can name a model per stage, so the portable script accepts `reasoningModel` and `workerModel` in args for Claude runs.
+Claude workflow agents inherit the session model when no model is supplied. The portable workflow accepts `reasoningModel` and `workerModel` for per-stage model routing.
 
-Install the same workflow source into the project:
+Install the same source into the project:
 
 ```bash
 mkdir -p .claude/workflows
 cp ~/.claude/skills/harness/harness.js .claude/workflows/harness.js
 ```
 
-Run it as the saved `/harness` workflow with args equivalent to:
+Run the saved `/harness` workflow with args equivalent to:
 
 ```json
 {
@@ -108,7 +113,7 @@ Run it as the saved `/harness` workflow with args equivalent to:
 }
 ```
 
-If a tier inherits the session model, omit that tier's model argument. If both inherit, set `tiered` to `false`.
+If a Claude tier inherits the session model, omit that tier's model argument. If both inherit, use `tiered: false`.
 
 Claude Dynamic Workflows must be enabled. If `/harness` does not appear after installing or editing the file, run `/reload-skills` and verify that Dynamic workflows are enabled in `/config`.
 
@@ -116,7 +121,7 @@ Claude Dynamic Workflows must be enabled. If `/harness` does not appear after in
 
 | Arg | Default | Meaning |
 |---|---|---|
-| `runtime` | `bb` | `bb` or `claude`. |
+| `runtime` | auto-detected | `bb` or `claude`. |
 | `goal` | required | The requested outcome. |
 | `context` | `""` | Background and constraints shared across roles. |
 | `checks` | `[]` | Commands that must pass before Critique. |
@@ -127,6 +132,8 @@ Claude Dynamic Workflows must be enabled. If `/harness` does not appear after in
 | `tiered` | `false` | Opt in to per-role model routing after preflight. |
 | `reasoningModel` | omitted | Claude-only Planner/Critic model; omitted means inherit. |
 | `workerModel` | omitted | Claude-only execution model; omitted means inherit. |
+| `inheritReasoning` | `false` | BB-only: Reasoning tier inherits origin thread. |
+| `inheritExecution` | `false` | BB-only: Execution tier inherits origin thread. |
 
 ## Roles
 
