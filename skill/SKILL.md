@@ -1,112 +1,189 @@
 ---
 name: harness
-
 description: "Use only when explicitly invoked."
-
 ---
 
 # Harness
 
-A DAG-driven agentic harness that runs on BB workflows. One goal in, a plan, parallel execution, and a verified verdict out.
+Run the same agentic lifecycle on either **BB Workflows** or **Claude Code Dynamic Workflows**:
 
-Based on Scott Fryxell's "The Harness Is the Thing" and Data4Sci's "Building an Advanced Agentic Harness". Their shared claim: the model is not the leverage, the structure around it is.
-
-## When to use it
-
-Use it when a task has real internal structure. Several pieces that do not depend on each other, or a chain where each step needs the one before it. The harness pays for itself by running the independent pieces at the same time and by forcing a verification pass you would otherwise skip.
-
-Do not use it for one edit, one question, or anything a single agent finishes in one pass. The planning and verification overhead is real and it will make small work slower and more expensive, not faster.
-
-The Critic is often the actual reason to reach for this. It reads the work on disk rather than the workers' summaries, which is where overstated "done" gets caught.
-
-## Running it
-
-The script lives beside this file at `harness.js`. BB resolves workflows by name from the project's own workspace, so it has to be copied in once per project.
-
-```bash
-# from the project root, first time only
-mkdir -p .bb/workflows
-cp ~/.claude/skills/harness/harness.js .bb/workflows/harness.js
-bb workflows validate --name harness
+```text
+Explore → Plan → Work → Check → Critique → Promote
 ```
 
-Then run it with `bb_workflow_run`, passing `name: "harness"` and an `args` object. Pass `args` as real JSON, never as a stringified blob.
+The workflow runtime is chosen before the run. Model selection is also resolved before the run; never silently guess a provider or model.
 
-```
-name: "harness"
-args: {
-  "goal": "Migrate every API route from the old error middleware to the new Result type",
-  "context": "Routes live in src/api/. The new type is in src/lib/result.ts.",
-  "checks": ["npm run typecheck", "npm test"]
-}
-```
+## Mandatory preflight
 
-After the call returns, emit its `previewDirective` once on its own line, outside any code fence. That renders live progress in chat.
+Before every new run:
 
-## Arguments
+1. Determine the runtime: `bb` or `claude`. If the user did not specify one, ask.
+2. Discover the models that are actually available for that runtime/account.
+3. Show the available choices compactly.
+4. Ask for two model tiers:
+   - **Reasoning** — Planner + Critic.
+   - **Execution** — Explorer + Workers + Promoter + Checker.
+5. Offer **inherit current/session model** for either or both tiers.
+6. Only after the user chooses, prepare and validate the runtime-specific workflow and run it.
 
-| Arg | Default | What it does |
-|---|---|---|
-| `goal` | required | What to accomplish. Be specific; the Planner only sees this and `context`. |
-| `context` | `""` | Background handed to every role. Where things live, constraints, prior decisions. |
-| `checks` | `[]` | Shell commands that must pass, e.g. `["npm test"]`. This is the tier 1 gate. |
-| `maxNodes` | 40 | Ceiling on plan size, including sub-nodes. |
-| `maxDepth` | 2 | How deep a Worker may nest sub-nodes. |
-| `maxReplans` | 2 | How many MISSING_INFO replans are allowed. |
-| `contextChars` | 6000 | Budget for upstream results in a Worker prompt. Overflow is dropped and the Worker is told so. |
-| `tiered` | true | `false` runs every role on the origin thread's own model. |
+Do not start the harness before this preflight is complete.
 
-Declaring `checks` matters more than it looks. With no checks the Critic is the only gate, and it is told so.
+## BB Workflows preflight
 
-## The roles
-
-**Planner** turns the goal into a DAG. Its output is validated in plain JavaScript before anything runs: duplicate ids, unknown dependencies, self-references, cycles by Kahn's algorithm, and the node ceiling. An invalid plan gets exactly one corrective pass with the validation errors shown, then the run fails. The Planner is a model and its output is treated as untrusted.
-
-**Workers** each take one node. Every node whose dependencies are satisfied runs at the same time. A Worker reports one of three statuses:
-
-- `done` finished, with a summary and the files it touched
-- `subnodes` the node contained distinct pieces of work that should run separately
-- `missing_info` the plan assumed something untrue and no work on this node fixes it
-
-`subnodes` is the deviation from both articles. They force a full replan when the plan turns out wrong. In coding work the Planner cannot know at plan time what node 3 will find, and a full replan throws away everything. Instead the Worker adds children, the parent is rewritten to depend on them, and the parent re-runs afterward so downstream nodes consume its result and not a stale one.
-
-`missing_info` is the expensive path and is reserved for a genuine wrong assumption. It triggers a replan that is shown what was already completed and why the run stalled, so the Planner does not re-emit the same plan.
-
-**Tier 1** runs the declared `checks` and reports. It does not fix anything. A failure here skips the Critic, because there is no point paying for judgment on work that does not compile.
-
-**Critic** reads the work on disk and returns accept or reject with specific issues. Taste is explicitly not a blocking issue.
-
-## Reading the result
-
-The run returns `outcome` as `accepted`, `rejected`, or `unverified`, plus the node trace, failures, degraded nodes, check results, and the Critic's issues.
-
-Report these honestly. `unverified` means the Critic never ran, which is not the same as passing. `degraded` nodes are ones that wanted to escalate but had exhausted their depth or replan budget, so they were accepted as-is. Both are easy to gloss over and both matter.
-
-## Tuning the models
-
-Model tiering is hardcoded in `roleAgent()` inside the script. It has to be: the BB workflow runtime requires literal provider and model strings and rejects values computed from args.
-
-The default puts the Planner and Critic at high reasoning and the Workers at medium. That is the articles' economics expressed through reasoning level rather than model choice, which avoids guessing at a strength ordering between sibling models. If you learn a cheaper model is genuinely good enough for execution, put it on the Worker line.
-
-Check what is actually available before editing:
+BB model overrides are exact tuples. Discover the live catalog first:
 
 ```bash
 bb provider list --environment "$BB_ENVIRONMENT_ID" --json
-bb provider models codex --environment "$BB_ENVIRONMENT_ID" --json
+bb provider models <provider-id> --environment "$BB_ENVIRONMENT_ID" --json
 ```
 
-## What it does not do
+Run the second command for the provider(s) the user may reasonably choose. If the provider list is short, inspect all of them. Never invent model ids.
 
-Worth knowing before you reach for it.
+Present choices in this shape:
 
-The script has no shell or filesystem access, so tier 1 checks run through an agent rather than a subprocess. It works and it costs one cheap agent call.
+```text
+BB Workflows
+Reasoning tier: provider / model / reasoning level | inherit current
+Execution tier: provider / model / reasoning level | inherit current
 
-There is no memory between runs. Each run starts cold. Pass what matters through `context`.
+Available providers/models:
+- codex: ...
+- claude-code: ...
+```
 
-Execution is level-synchronous. A node waits for its whole level to finish rather than starting the instant its own dependencies are done. Simpler to read, and it costs some wall clock on lopsided levels.
+BB requires all three override fields together: `provider`, `model`, and `reasoningLevel`. A tier that inherits must omit the entire tuple.
 
-BB caps a run at 100 agent calls and 8 concurrent agents. A very large DAG will hit that.
+The distributed `harness.js` contains two explicitly marked literal BB profile blocks because BB requires literal selection values in `agent()` calls. Before a tiered BB run:
 
-## Resuming
+1. copy `harness.js` into the target project's `.bb/workflows/`;
+2. rewrite `BB_REASONING_PROFILE_*` with the selected Reasoning tuple unless that tier inherits;
+3. rewrite `BB_EXECUTION_PROFILE_*` with the selected Execution tuple unless that tier inherits;
+4. validate the exact copied file before execution.
 
-Runs are durable. After a stop, a crash, or an edit to the script, relaunch with the same source and `resumeRunId`. The longest unchanged prefix of successful agent calls replays from cache and only the first changed call onward runs live. Edits to a Worker prompt invalidate that call and everything after it, so expect a partial replay, not a free one.
+Do not mutate the source copy in this skill directory.
+
+```bash
+mkdir -p .bb/workflows
+cp ~/.claude/skills/harness/harness.js .bb/workflows/harness.js
+bb workflows validate --file .bb/workflows/harness.js
+```
+
+Run with `tiered: true` after explicit model selection:
+
+```bash
+bb workflows run --file .bb/workflows/harness.js --args '{"runtime":"bb","goal":"...","context":"...","checks":[],"tiered":true}'
+```
+
+For a mixed profile, set `inheritReasoning: true` and/or `inheritExecution: true` for the tier that should inherit the originating BB thread. If both tiers inherit, use `tiered: false` and do not patch either tuple.
+
+After a BB workflow tool call returns, emit its `previewDirective` once on its own line.
+
+## Claude Code Dynamic Workflows preflight
+
+Use Claude Code's live `/model` picker as the source of truth for models available to the current account/session. Ask the user to choose from what `/model` shows rather than assuming that every Claude model or alias is enabled by their organization.
+
+Ask for:
+
+```text
+Claude Workflows
+Reasoning model: <model from /model> | inherit session
+Execution model: <model from /model> | inherit session
+```
+
+Claude workflow agents inherit the session model when no model is supplied. The portable workflow accepts `reasoningModel` and `workerModel` for per-stage model routing.
+
+Install the same source into the project:
+
+```bash
+mkdir -p .claude/workflows
+cp ~/.claude/skills/harness/harness.js .claude/workflows/harness.js
+```
+
+Run the saved `/harness` workflow with args equivalent to:
+
+```json
+{
+  "runtime": "claude",
+  "goal": "...",
+  "context": "...",
+  "checks": [],
+  "tiered": true,
+  "reasoningModel": "<selected reasoning model>",
+  "workerModel": "<selected execution model>"
+}
+```
+
+If a Claude tier inherits the session model, omit that tier's model argument. If both inherit, use `tiered: false`.
+
+Claude Dynamic Workflows must be enabled. If `/harness` does not appear after installing or editing the file, run `/reload-skills` and verify that Dynamic workflows are enabled in `/config`.
+
+## Arguments
+
+| Arg | Default | Meaning |
+|---|---|---|
+| `runtime` | auto-detected | `bb` or `claude`. |
+| `goal` | required | The requested outcome. |
+| `context` | `""` | Background and constraints shared across roles. |
+| `checks` | `[]` | Commands that must pass before Critique. |
+| `maxNodes` | 40 | Maximum graph size including sub-nodes. |
+| `maxDepth` | 2 | Maximum sub-node nesting depth. |
+| `maxReplans` | 2 | Maximum `missing_info` replans. |
+| `contextChars` | 6000 | Upstream-result budget per Worker prompt. |
+| `tiered` | `false` | Opt in to per-role model routing after preflight. |
+| `reasoningModel` | omitted | Claude-only Planner/Critic model; omitted means inherit. |
+| `workerModel` | omitted | Claude-only execution model; omitted means inherit. |
+| `inheritReasoning` | `false` | BB-only: Reasoning tier inherits origin thread. |
+| `inheritExecution` | `false` | BB-only: Execution tier inherits origin thread. |
+
+## Roles
+
+**Explorer** performs broad discovery first. It verifies repository facts, relevant files, constraints, and unknowns without implementing the goal. It creates a unique persistent directory under `artifacts/runs/`, writes `exploration.md`, and returns that exact path.
+
+**Planner** plans from Explorer findings rather than repeating broad exploration. It returns a validated DAG and writes `plan.md`; bounded replans write `replan-N.md`.
+
+**Workers** execute runnable nodes in parallel. They return `done`, `subnodes`, or `missing_info`. Subnodes extend the graph. `missing_info` can trigger a bounded replan.
+
+**Tier 1 Checker** runs declared checks without fixing files. A failed check prevents Critique.
+
+**Critic** verifies the workspace on disk, not Worker summaries, and writes `critique.md`.
+
+**Promoter** runs only after the Critic accepts. It does not modify implementation files; it writes `promotion.md` with handoff notes, validation evidence, and follow-ups.
+
+## Dependency semantics
+
+Do not equate "has a result" with "satisfied dependency".
+
+- successful nodes satisfy dependencies;
+- degraded nodes satisfy dependencies but remain visible;
+- failed nodes do not satisfy dependencies;
+- blocked nodes do not satisfy dependencies.
+
+When a Worker fails, every unfinished descendant that depends on it directly or transitively is marked `blocked` and must not be dispatched. Failed or blocked execution remains `unverified`.
+
+## Persistent artifacts
+
+Runs normally leave:
+
+```text
+artifacts/runs/<run-id>/
+├── exploration.md
+├── plan.md
+├── critique.md
+└── promotion.md
+```
+
+The workflow returns the artifact paths. Runtime run directories are gitignored but persist in the workspace.
+
+## Reading the result
+
+`outcome` is one of:
+
+- `accepted` — Critic accepted the final workspace;
+- `rejected` — Critic ran and rejected it;
+- `unverified` — Critic did not run.
+
+Also inspect `failed`, `blocked`, `degraded`, `stalled`, `checks`, `critic`, `promotion`, and `artifacts`. Do not gloss over non-empty failure/degradation fields.
+
+## Resume
+
+Both runtimes have durable/replay behavior, but use their native run controls. Preserve the same workflow source and args when resuming. The Explorer output includes the persistent artifact directory so replayed later stages continue to point at the same run artifacts.

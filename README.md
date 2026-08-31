@@ -1,131 +1,183 @@
 # agentic-harness
 
-A DAG-driven agentic harness that runs on [BB](https://getbb.app) workflows. One goal in, a plan, parallel execution, and a verified verdict out.
+A portable DAG-driven agentic harness for **BB Workflows** and **Claude Code Dynamic Workflows**.
 
-A Planner breaks the goal into a task graph. Workers execute the independent nodes at the same time. Deterministic checks run before an LLM Critic is allowed to spend anything, and the Critic reads the work on disk rather than the workers' summaries.
+```text
+Explore → Plan → Work → Check → Critique → Promote
+```
 
-It is one JavaScript file and one skill. There is no plugin to install, no server, and no database.
+One workflow source powers both runtimes. The runtime-specific launcher behavior lives in `skill/SKILL.md`: before a new run it discovers the models available to that runtime/account, shows them, asks which models to use for reasoning and execution, and only then starts the workflow.
 
-## Why
+The design is influenced by Scott Fryxell's [The Harness Is the Thing](https://scott-fryxell.github.io/blog/the-harness-is-the-thing/) and Data4Sci's [Building an Advanced Agentic Harness](https://data4sci.com/blog/building-an-advanced-agentic-harness).
 
-Two articles argue the same thing from different directions:
+## Runtime model
 
-- [The Harness Is the Thing](https://scott-fryxell.github.io/blog/the-harness-is-the-thing/), Scott Fryxell. Models are commodities. The structure you wrap around them is the leverage. He runs a five-stage arc with role-isolated agents and keeps frontier models off the bulk of the work.
-- [Building an Advanced Agentic Harness](https://data4sci.com/blog/building-an-advanced-agentic-harness), Data4Sci. Production agents need composition around the naive loop: a planner that emits a whole dependency graph, parallel execution capped by a semaphore, a two-tier verification gate, and budgets that force a stop.
+The lifecycle and result semantics are shared. Only model routing and runtime controls differ.
 
-Both describe systems you would build. This is the observation that most of it already exists: BB workflows already gives durable runs, hidden worker threads, per-agent model selection, structured output, concurrency caps, resume, and an append-only trace. What was actually missing was the planning loop, and that is 40 lines.
+| Concern | BB Workflows | Claude Code Workflows |
+|---|---|---|
+| Project workflow path | `.bb/workflows/harness.js` | `.claude/workflows/harness.js` |
+| Default model | originating BB thread | current Claude session model |
+| Explicit model routing | `provider + model + reasoningLevel` | per-agent `model` |
+| Model discovery | `bb provider list` + `bb provider models` | live `/model` picker |
+| Resume / progress | BB workflow controls | `/workflows` |
 
-## Install
+The harness uses two logical tiers:
+
+- **Reasoning** — Planner + Critic.
+- **Execution** — Explorer + Workers + Checker + Promoter.
+
+The launcher must resolve these tiers before starting a new run. It never guesses model ids.
+
+## Install the skill
 
 ```bash
 git clone https://github.com/isacfg/agentic-harness.git
 cd agentic-harness
 
-# per project you want to use it in
-mkdir -p /path/to/project/.bb/workflows
-cp harness.js /path/to/project/.bb/workflows/harness.js
-
-# optional: the skill, so an agent can drive it for you
 mkdir -p ~/.claude/skills/harness
 cp skill/SKILL.md harness.js ~/.claude/skills/harness/
 ```
 
-Verify from the project root:
+Then explicitly invoke the `harness` skill and give it a goal. The skill asks which runtime to use when that was not already specified.
 
-```bash
-bb workflows validate --name harness
-```
+## BB Workflows
 
-## Use
-
-```bash
-bb workflows run --name harness --args '{
-  "goal": "Migrate every API route in src/api/ from the old error middleware to the new Result type",
-  "context": "The new type is in src/lib/result.ts. Response contracts must not change.",
-  "checks": ["npm run typecheck", "npm test"]
-}'
-```
-
-Or, with the skill installed, tell your agent `/harness` and what you want.
-
-### Arguments
-
-| Arg | Default | What it does |
-|---|---|---|
-| `goal` | required | What to accomplish. The Planner sees only this and `context`. |
-| `context` | `""` | Background for every role: where things live, constraints, prior decisions. |
-| `checks` | `[]` | Shell commands that must pass. This is the tier 1 gate. |
-| `maxNodes` | 40 | Ceiling on plan size, including sub-nodes. |
-| `maxDepth` | 2 | How deep a Worker may nest sub-nodes. |
-| `maxReplans` | 2 | How many `missing_info` replans are allowed. |
-| `contextChars` | 6000 | Budget for upstream results in a Worker prompt. |
-| `tiered` | `true` | `false` runs every role on the origin thread's own model. |
-
-Declaring `checks` matters more than it looks. With none, the Critic is the only gate, and it is told so.
-
-## How it works
-
-**Planner** returns a DAG. Its output is validated in plain JavaScript before anything runs: duplicate ids, unknown dependencies, self-references, cycles by Kahn's algorithm, and the node ceiling. An invalid plan gets one corrective pass showing the validation errors, then the run fails. The Planner is a model, so its output is untrusted input.
-
-**Workers** each take one node. Every node whose dependencies are satisfied runs at once. A Worker returns one of three statuses:
-
-- `done` finished, with a summary and the files it touched
-- `subnodes` the node contained distinct work that should run separately
-- `missing_info` the plan assumed something untrue, and no work on this node fixes it
-
-`subnodes` is the deliberate deviation from both articles. They force a full replan when a plan turns out wrong, throwing away completed work. In coding tasks the Planner cannot know at plan time what node 3 will find. Here the Worker returns children, the parent is rewritten to depend on them, and the parent re-runs afterward so downstream nodes consume its updated result rather than a stale one.
-
-`missing_info` is the expensive path, reserved for a genuine wrong assumption. The replan is shown what was already completed and why the run stalled, so the Planner does not re-emit the same plan.
-
-**Tier 1** runs the declared checks and reports. It fixes nothing. A failure here skips the Critic, because judging code that does not compile is wasted.
-
-**Critic** reads the work on disk and returns accept or reject with specific issues. Taste is explicitly not a blocking issue.
-
-## Reading the result
-
-`outcome` is `accepted`, `rejected`, or `unverified`.
-
-`unverified` means the Critic never ran. That is not the same as passing, and it is the easiest field to misread.
-
-`degraded` lists nodes that wanted to escalate but had exhausted their depth or replan budget and were accepted as-is. Worth a look.
-
-## Model tiering
-
-Tiering is hardcoded in `roleAgent()` near the top of `harness.js`. It has to be: the BB workflow runtime requires literal provider and model strings and rejects values computed from args.
-
-The default puts the Planner and Critic at high reasoning and the Workers at medium. That expresses the articles' economics through reasoning level rather than model choice, which avoids guessing at a strength ordering between sibling models. Edit the tuples to retune.
+Before a tiered run, inspect the live catalog:
 
 ```bash
 bb provider list --environment "$BB_ENVIRONMENT_ID" --json
-bb provider models codex --environment "$BB_ENVIRONMENT_ID" --json
+bb provider models <provider-id> --environment "$BB_ENVIRONMENT_ID" --json
 ```
+
+The skill shows the available choices and asks for the exact Reasoning and Execution tuples. BB requires literal model tuples in workflow `agent()` calls, so the launcher copies `harness.js` into the project and rewrites the two marked BB profile blocks with the selected live values.
+
+```bash
+mkdir -p .bb/workflows
+cp harness.js /path/to/project/.bb/workflows/harness.js
+bb workflows validate --file /path/to/project/.bb/workflows/harness.js
+```
+
+Example args after model preflight:
+
+```json
+{
+  "runtime": "bb",
+  "goal": "Migrate every API route to the new Result type",
+  "context": "Response contracts must not change.",
+  "checks": ["npm run typecheck", "npm test"],
+  "tiered": true
+}
+```
+
+Set `inheritReasoning` or `inheritExecution` to `true` when only that BB tier should inherit the originating thread model. Set `tiered: false` when every role should inherit it.
+
+## Claude Code Dynamic Workflows
+
+Install the same source as a project workflow:
+
+```bash
+mkdir -p .claude/workflows
+cp harness.js /path/to/project/.claude/workflows/harness.js
+```
+
+Use Claude Code's `/model` picker to inspect what the current account/organization actually allows. The launcher asks which available model should handle each tier. Claude stages with no explicit model inherit the session model.
+
+Example args:
+
+```json
+{
+  "runtime": "claude",
+  "goal": "Migrate every API route to the new Result type",
+  "context": "Response contracts must not change.",
+  "checks": ["npm run typecheck", "npm test"],
+  "tiered": true,
+  "reasoningModel": "<selected model>",
+  "workerModel": "<selected model>"
+}
+```
+
+After installation, the saved workflow is available as `/harness`. If an edited workflow is not picked up, reload skills/workflows in Claude Code.
+
+## Arguments
+
+| Arg | Default | What it does |
+|---|---|---|
+| `runtime` | auto-detected | `bb` or `claude`. |
+| `goal` | required | What to accomplish. |
+| `context` | `""` | Background and constraints shared by roles. |
+| `checks` | `[]` | Commands that must pass before Critique. |
+| `maxNodes` | 40 | Ceiling on plan size, including sub-nodes. |
+| `maxDepth` | 2 | Maximum Worker sub-node nesting depth. |
+| `maxReplans` | 2 | Maximum `missing_info` replans. |
+| `contextChars` | 6000 | Upstream-result budget per Worker prompt. |
+| `tiered` | `false` | Enables per-role model routing after model preflight. |
+| `reasoningModel` | inherit | Claude Reasoning-tier model. |
+| `workerModel` | inherit | Claude Execution-tier model. |
+| `inheritReasoning` | `false` | BB: make only the Reasoning tier inherit the origin thread. |
+| `inheritExecution` | `false` | BB: make only the Execution tier inherit the origin thread. |
+
+## Lifecycle
+
+### Explore
+
+The Explorer performs broad repository discovery before planning. It records verified facts, relevant files, constraints, unknowns, and disproved assumptions without implementing the goal. It creates a unique persistent directory under `artifacts/runs/<run-id>/` and writes `exploration.md`.
+
+### Plan
+
+The Planner receives Explorer output and turns it into a DAG. The graph is validated for duplicate ids, unknown dependencies, self references, cycles, and the node ceiling. The accepted plan is written to `plan.md`; bounded replans write `replan-N.md`.
+
+### Work
+
+Runnable nodes execute in parallel. Workers return `done`, `subnodes`, or `missing_info`. Subnodes extend the graph; `missing_info` can trigger a bounded replan.
+
+A result existing does not automatically satisfy a dependency. Failed or blocked nodes never satisfy dependencies, and failure blocks unfinished descendants transitively.
+
+### Check
+
+A dedicated Checker agent runs declared commands without fixing files. A failed check prevents Critique.
+
+### Critique
+
+The Critic verifies the final workspace on disk rather than trusting Worker summaries. It accepts or rejects and writes `critique.md`.
+
+### Promote
+
+After acceptance, the Promoter writes `promotion.md` with a concise handoff, release/PR notes, validation evidence that actually ran, and follow-up work. It does not modify implementation files.
+
+## Persistent artifacts
+
+```text
+artifacts/runs/<run-id>/
+├── exploration.md
+├── plan.md
+├── critique.md
+└── promotion.md
+```
+
+Runtime run directories are gitignored but persist in the workspace. `artifacts/README.md` defines the contract and `AGENTS.md` defines role boundaries and failure semantics.
+
+## Reading the result
+
+`outcome` is `accepted`, `rejected`, or `unverified`. Also inspect `failed`, `blocked`, `degraded`, `stalled`, `checks`, `critic`, `promotion`, and `artifacts`. `unverified` is not success.
 
 ## Known limits
 
-Stated plainly, because these decide whether it fits your task.
+- Neither workflow script has direct filesystem/shell access; agents perform filesystem and command work.
+- Execution is level-synchronous where this implementation uses `parallel()` as a barrier.
+- Model availability is runtime/account-specific, which is why the skill performs model preflight instead of embedding assumptions.
+- Persistent run artifacts depend on agents respecting the role contract in `AGENTS.md`.
 
-- The workflow script has no shell or filesystem access, so tier 1 checks run through an agent rather than a subprocess.
-- No memory between runs. Each run starts cold; pass what matters through `context`.
-- Execution is level-synchronous. A node waits for its whole level rather than starting the moment its own dependencies finish. Simpler to read, and it costs wall clock on lopsided levels.
-- BB caps a run at 100 agent calls and 8 concurrent agents.
-- Nobody reviews the Planner. The Critic checks the work, not the plan. In testing, a Planner read a design document describing a plugin and asserted that the plugin existed on disk. It did not. The wrong belief was harmless that time.
+## Repository
 
-## What is in here
-
-| Path | What |
+| Path | Purpose |
 |---|---|
-| `harness.js` | The workflow. This is the whole thing. |
-| `skill/SKILL.md` | Claude Code skill so an agent can drive it. |
-| `docs/plugin-design.md` | The road not taken: a full design for building this as a native BB plugin instead. |
-| `examples/smoke-test/` | The utility the harness built to verify itself, tests included. |
-
-### About `docs/plugin-design.md`
-
-Before writing the script, this was designed as a native BB plugin: SQLite DAG state, a background scheduler, compare-and-swap node claims, crash recovery, a custom graph panel. Six agents designed it in parallel, six adversarial reviewers found 26 blocking problems, and a synthesizer merged the result. The build order came to 18 to 31 days.
-
-Then the obvious question landed: BB workflows already does most of that. The script took one session.
-
-The document is kept because it is a genuinely detailed specification of the problem, and because the reviewers found real things. Four of six independently flagged leaked hidden threads as the most likely defect, which is the kind of finding that justifies the whole review pass.
+| `harness.js` | Portable BB / Claude workflow implementation. |
+| `AGENTS.md` | Shared role constitution and dependency semantics. |
+| `skill/SKILL.md` | Interactive runtime/model launcher contract. |
+| `artifacts/README.md` | Persistent run artifact contract. |
+| `docs/plugin-design.md` | Earlier native-plugin design. |
+| `examples/smoke-test/` | Example utility built by the harness. |
 
 ## License
 
