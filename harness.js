@@ -1,7 +1,7 @@
 export const meta = {
   name: "harness",
   description:
-    "Explorer establishes facts, Planner emits a DAG, Workers execute ready nodes, checks gate a Critic, and an accepted run is packaged by a Promoter",
+    "Portable agentic harness for BB Workflows and Claude Code Dynamic Workflows: Explore, Plan, Work, Check, Critique, Promote",
   phases: [
     { title: "Explore", detail: "Explorer establishes repository facts and a persistent run artifact directory" },
     { title: "Plan", detail: "Planner emits a validated task DAG from exploration facts" },
@@ -27,22 +27,61 @@ if (typeof input !== "object" || Array.isArray(input)) {
 const GOAL = input.goal;
 if (!GOAL || typeof GOAL !== "string") throw new Error("harness: args.goal is required and must be a string");
 
+const HAS_BB_BUDGET = typeof budget === "function";
+const RUNTIME = input.runtime || (HAS_BB_BUDGET ? "bb" : "claude");
+if (RUNTIME !== "bb" && RUNTIME !== "claude") {
+  throw new Error(`harness: runtime must be "bb" or "claude", got "${RUNTIME}"`);
+}
+if (RUNTIME === "bb" && !HAS_BB_BUDGET) {
+  throw new Error("harness: runtime=bb was requested outside the BB workflow runtime");
+}
+
 const BACKGROUND = input.context || "";
 const CHECKS = Array.isArray(input.checks) ? input.checks : [];
 const MAX_NODES = input.maxNodes || 40;
 const MAX_DEPTH = input.maxDepth === undefined ? 2 : input.maxDepth;
 const MAX_REPLANS = input.maxReplans === undefined ? 2 : input.maxReplans;
 const CONTEXT_CHARS = input.contextChars || 6000;
-const TIERED = input.tiered !== false;
+const TIERED = input.tiered === true;
+const REASONING_MODEL = typeof input.reasoningModel === "string" && input.reasoningModel ? input.reasoningModel : null;
+const WORKER_MODEL = typeof input.workerModel === "string" && input.workerModel ? input.workerModel : null;
+const INHERIT_REASONING = input.inheritReasoning === true;
+const INHERIT_EXECUTION = input.inheritExecution === true;
 
-const limits = budget();
-log(`harness: limits ${limits.maxAgentCalls} calls / ${limits.maxConcurrentAgents} concurrent; maxNodes=${MAX_NODES} maxDepth=${MAX_DEPTH} maxReplans=${MAX_REPLANS}`);
+if (RUNTIME === "bb") {
+  const limits = budget();
+  log(`harness: BB limits ${limits.maxAgentCalls} calls / ${limits.maxConcurrentAgents} concurrent; maxNodes=${MAX_NODES} maxDepth=${MAX_DEPTH} maxReplans=${MAX_REPLANS}`);
+} else {
+  log(`harness: Claude workflow; maxNodes=${MAX_NODES} maxDepth=${MAX_DEPTH} maxReplans=${MAX_REPLANS}`);
+}
+
+function inheritedAgent(prompt, label, phaseName, schema) {
+  return agent(prompt, { label: label, phase: phaseName, schema: schema });
+}
 
 function roleAgent(prompt, label, phaseName, schema, role) {
-  if (!TIERED) {
-    return agent(prompt, { label: label, phase: phaseName, schema: schema });
+  if (!TIERED) return inheritedAgent(prompt, label, phaseName, schema);
+
+  const reasoningRole = role === "planner" || role === "critic";
+
+  if (RUNTIME === "claude") {
+    const selectedModel = reasoningRole ? REASONING_MODEL : WORKER_MODEL;
+    if (!selectedModel) return inheritedAgent(prompt, label, phaseName, schema);
+    return agent(prompt, {
+      label: label,
+      phase: phaseName,
+      schema: schema,
+      model: selectedModel,
+    });
   }
-  if (role === "planner" || role === "critic") {
+
+  if ((reasoningRole && INHERIT_REASONING) || (!reasoningRole && INHERIT_EXECUTION)) {
+    return inheritedAgent(prompt, label, phaseName, schema);
+  }
+
+  if (reasoningRole) {
+    // BB_REASONING_PROFILE_START
+    // The launcher rewrites this literal tuple only after inspecting the live BB catalog.
     return agent(prompt, {
       label: label,
       phase: phaseName,
@@ -51,7 +90,11 @@ function roleAgent(prompt, label, phaseName, schema, role) {
       model: "gpt-5.6-luna",
       reasoningLevel: "high",
     });
+    // BB_REASONING_PROFILE_END
   }
+
+  // BB_EXECUTION_PROFILE_START
+  // The launcher rewrites this literal tuple only after inspecting the live BB catalog.
   return agent(prompt, {
     label: label,
     phase: phaseName,
@@ -60,6 +103,7 @@ function roleAgent(prompt, label, phaseName, schema, role) {
     model: "gpt-5.6-luna",
     reasoningLevel: "medium",
   });
+  // BB_EXECUTION_PROFILE_END
 }
 
 const EXPLORER_SCHEMA = {
@@ -404,7 +448,7 @@ const declaredChecks = CHECKS.concat(nodes.reduce((all, node) => all.concat(node
 let checkResult = null;
 if (declaredChecks.length && !failedNodes.length && !blockedNodes.length) {
   phase("Check");
-  checkResult = await agent(`${rolePreamble(ARTIFACT_DIR)}\n\nYOUR ROLE: TIER 1 CHECKER\n\nRun each command exactly as written from the workspace root. Do not fix or modify anything. passed=true only if every command exits successfully.\n\n${declaredChecks.map((check, index) => `${index + 1}. ${check}`).join("\n")}`, { label: "tier1-checks", phase: "Check", schema: CHECK_SCHEMA });
+  checkResult = await roleAgent(`${rolePreamble(ARTIFACT_DIR)}\n\nYOUR ROLE: TIER 1 CHECKER\n\nRun each command exactly as written from the workspace root. Do not fix or modify anything. passed=true only if every command exits successfully.\n\n${declaredChecks.map((check, index) => `${index + 1}. ${check}`).join("\n")}`, "tier1-checks", "Check", CHECK_SCHEMA, "checker");
   log(`tier 1 checks: ${checkResult.passed ? "PASSED" : "FAILED"}`);
 } else if (failedNodes.length || blockedNodes.length) {
   log("tier 1 skipped because execution contains failed or blocked nodes");
@@ -434,6 +478,7 @@ if (critique && critique.verdict === "accept") {
 const blocking = critique ? (critique.issues || []).filter((issue) => issue.severity === "blocking") : [];
 
 return {
+  runtime: RUNTIME,
   goal: GOAL,
   outcome: critique ? (critique.verdict === "accept" ? "accepted" : "rejected") : "unverified",
   artifacts: { dir: ARTIFACT_DIR, exploration: `${ARTIFACT_DIR}/exploration.md`, plan: `${ARTIFACT_DIR}/plan.md`, critique: critique ? `${ARTIFACT_DIR}/critique.md` : null, promotion: promotion ? promotion.artifact : null },
