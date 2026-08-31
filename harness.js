@@ -39,15 +39,26 @@ const limits = budget();
 log(`harness: limits ${limits.maxAgentCalls} calls / ${limits.maxConcurrentAgents} concurrent; maxNodes=${MAX_NODES} maxDepth=${MAX_DEPTH} maxReplans=${MAX_REPLANS}`);
 
 function roleAgent(prompt, label, phaseName, schema, role) {
-  if (!TIERED) return agent(prompt, { label, phase: phaseName, schema });
-  const high = role === "planner" || role === "critic";
+  if (!TIERED) {
+    return agent(prompt, { label: label, phase: phaseName, schema: schema });
+  }
+  if (role === "planner" || role === "critic") {
+    return agent(prompt, {
+      label: label,
+      phase: phaseName,
+      schema: schema,
+      provider: "codex",
+      model: "gpt-5.6-luna",
+      reasoningLevel: "high",
+    });
+  }
   return agent(prompt, {
-    label,
+    label: label,
     phase: phaseName,
-    schema,
+    schema: schema,
     provider: "codex",
     model: "gpt-5.6-luna",
-    reasoningLevel: high ? "high" : "medium",
+    reasoningLevel: "medium",
   });
 }
 
